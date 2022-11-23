@@ -1,0 +1,935 @@
+---
+title: "clean_fish_tables"
+author: "Catarina Pien"
+date: "4/19/2022"
+output:
+  html_document: default
+  pdf_document: default
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+Load libraries
+```{r load }
+library(tidyverse)
+library(lubridate)
+library(anytime)
+library(stringr)
+library(magrittr)
+library(kableExtra)
+library(viridis)
+library(plotly)
+
+Sys.setenv(TZ = "America/Los_Angeles")
+```
+
+
+# A. Import in data
+
+## 1. Save tables into Data folder.
+## 2. Read in file
+```{r importdata}
+# Data retrieved 5/10/2022 from Access unless otherwise labeled
+# Read in catch from folder
+filenames <- list.files("data_raw/Catch", pattern="*.csv", full.names=TRUE)
+Catchread <- lapply(filenames, read.csv)
+
+# Bind fish catch files together
+fish_catch <- bind_rows(Catchread, .id = "column_label")
+effort <- read.csv("data_raw/YBFMP_TrapHours_2010_2022.csv")
+fish_stations <- read.csv("data_raw/YBFMP_Stations_Coordinates_info.csv")
+fish_ref <- read.csv("data_raw/Sample_20221123.csv")
+fish_tax <- read.csv("data_raw/OrganismsLookUp_20221123.csv")
+fish_tax_ed <- read.csv("data_raw/FishTaxonomyKISTERS.csv") #Edited for KISTERS, only has species present
+smelt_gen <- read.csv("data_raw/SmeltGenetics_20221123.csv")
+salm_gen <- read.csv("data_raw/SalmGenetics_20221123.csv")
+seine <- read.csv("data_raw/SeineEffort_20221123.csv")
+trap <- read.csv("data_raw/TrapEffort_20221123.csv")
+#cwt <- read.csv("data_raw/CWT_20210722.csv")
+iepfishcodes <- readxl::read_excel("data_raw/IEPFishCodes.xlsx", sheet = 2) %>% as.data.frame() %>%
+  select(IEPFishCode, CommonName, Taxa = ScientificName) %>%
+  filter(!(IEPFishCode %in% c("STRBA0", "STRBA1", "STRBA2", "STRBA3"))) 
+str(fish_ref)
+```
+
+#  B. Structural QA/QC
+
+##3. Clean up tables
+
+- remove certain columns
+- filter levels
+- clean up categorical variable naming (e.g. rename levels)
+- add columns
+- rename columns
+- remove NAs
+
+### Fish_ref (sampling)
+```{r clean}
+# Sample 
+fish_ref_clean <- fish_ref %>% 
+  select(-c(YSI.Handheld..,DataCorrectionComments, UserName:s_Lineage, Entered.By, Checked.By)) %>%
+  filter(!StationCode %in% c("STB", "STB3", "STB5", "STFP", "YBSP1", "CCS5", "CCS6")) %>%
+  mutate(StationCode = replace(StationCode, StationCode == "STS", "BL4"),
+         StationCode = replace(StationCode, StationCode == "YBSP1", "YB")) %>%
+  mutate(StationCode = replace(as.character(StationCode), StationCode == "LI", "LIS")) %>%
+  mutate(MethodCode = replace(MethodCode, MethodCode == "FNET", "FKTR")) %>%
+  mutate(Datetime = paste(SampleDate, SampleTime, sep = " "),
+         Datetime = mdy_hms(Datetime),
+         SampleDate = as.Date(SampleDate,format ="%m/%d/%Y"),
+         SampleTime = parse_date_time(SampleTime, '%I:%M:%S %p')) %>%
+  filter(MethodCode %in% c("FKTR", "BSEIN", "RSTR"),
+         !is.na(SampleID),
+         !(is.na(Datetime))) %>%
+  rename(WaterTemp = WaterTemperature,
+         SpecificConductance = SpCnd,
+         MicrocystisRank = MicrocystisVisualRank,
+         GearCode = GearID,
+         EventID = SampleID)%>%
+  mutate(across(.cols = c(GearCode, WeatherCode), .fns = na_if, "")) %>%
+    filter(lubridate::year(Datetime) < 2023) %>%
+  mutate(SampleAltered = ifelse(SampleDate<ymd("2022-02-22"), NA, SampleAltered)) %>%
+  select(EventID, StationCode, Datetime, SampleDate, WaterTemp, SpecificConductance, Conductivity, Turbidity, DO, pH, Secchi, WeatherCode, VegetationRank, MicrocystisRank, MethodCode, GearCode, GearConditionCode, SampleAltered) %>%
+  arrange(Datetime)
+
+unique(fish_ref_clean$VegetationRank)
+unique(fish_ref_clean$GearConditionCode)
+unique(fish_ref_clean$StationCode)
+unique(fish_ref_clean$MethodCode)
+unique(fish_ref_clean$GearCode)
+
+```
+
+### Station
+```{r}
+# Station Number
+staNum_clean <- fish_stations %>%
+  select(c(1,2)) %>%
+  rename(StationCode = Station.Name,
+         StationNumber = Station.Number)
+
+# Station clean
+fish_stations_only <- fish_stations %>% 
+  filter(grepl("FISH", Databases)) %>%
+  select(StationCode = Station.Name, 
+         StationName = Station.Name..Long.,
+         StationNumber = Station.Number,
+         Latitude, Longitude, 
+         PeriodOfRecordFrom = Period.of.Record..From.,
+         PeriodOfRecordTo = Period.of.Record..To.,
+         MonitoringType = Monitoring.Type)%>%
+  mutate(MethodCode = case_when(StationCode == "STTD"~ "RSTR",
+                                StationCode == "PCS"~ "FKTR",
+                                TRUE~"BSEIN"))
+```
+
+### Catch
+```{r}
+# Catch
+fish_catch_clean0 <- fish_catch %>%
+  select(-c(s_ColLineage:s_Lineage,  Direct.Take:Indirect.Take, column_label)) %>%
+  mutate(OrganismCode = ifelse(as.character(OrganismCode) == "lp", "LP", as.character(OrganismCode)),
+         OrganismCode = ifelse(as.character(OrganismCode) == "tfs", "TFS", as.character(OrganismCode)),
+  OrganismCode = ifelse(as.character(OrganismCode) == "SF", "PKN", as.character(OrganismCode))) %>%
+  rename(FishIDComments = Comments,
+         PlusCount = Plus.Count, 
+         Expression = Spawning.Condition,
+         GeneticSample = Genetic.Sample,
+         RaceByLength = Race,
+         EventID = SampleID) %>%
+  mutate(Dead = replace(Dead, Dead == "yes", "Yes")) %>%
+  mutate(SampleID = 1:nrow(.)) %>%
+  mutate(RaceByLength = 
+        ifelse(RaceByLength %in% c("f", "F"), "Fall",
+        ifelse(RaceByLength == "S", "Spring",
+        ifelse(RaceByLength == "LF", "LateFall",
+        ifelse(RaceByLength == "W", "Winter",                     
+               ifelse((RaceByLength == "U" | RaceByLength == "" | RaceByLength == "n/p"), NA, as.character(RaceByLength))))))) %>%
+  mutate(RaceByLength = ifelse(FishTagID %in% c("2019Ad_plus-F_285", "2019Ad_plus-F_281"), "Fall", 
+ifelse(FishTagID == "2019Ad_plus-F_278", "LateFall", as.character(RaceByLength)))) %>%
+  mutate(Sex = ifelse(Sex == "Female", "F",
+               ifelse(Sex == "Male", "M",
+               ifelse(Sex == "Unknown", "U", NA)))) %>%
+  mutate(FishTagID = str_replace_all(FishTagID, "2019Ad_Plus", "2019Ad_plus")) %>%
+  mutate(MarkCode = ifelse(MarkCode == "none", "None",
+                    ifelse(MarkCode == "n/p", NA, as.character(MarkCode)))) %>%
+  mutate(Expression = 
+        ifelse(Expression == "Expressing Eggs", "EGGS",
+        ifelse(Expression == "Expressing Milt", "MILT",
+               NA))) %>%
+  mutate(StageCode = 
+           ifelse(as.character(StageCode) == "CHN_S", "SMT",
+          ifelse(as.character(StageCode) == "CHN_P", "PAR",
+         ifelse(as.character(StageCode) == "CHN_X", "TRS",              ifelse(substring(FishTagID, 1L, 1L) == "A", "ADT",
+        NA))))) %>%
+  rename(FishGenID = FishTagID) %>%
+    mutate(PlusCount = replace(PlusCount, is.na(ForkLength) & Count >1, TRUE),
+      PlusCount = replace(PlusCount, !is.na(ForkLength) & Count == 1, FALSE)) %>% #identify plus counts if no measurements and count >1. If measurement included, plus count should be FALSE.
+  filter(!is.na(EventID),# remove if no ID
+         Count != 0)# remove count = 0 
+
+# Make SampleID and OrganismID
+fish_catch_clean <- left_join(fish_catch_clean0, fish_ref_clean %>% select(EventID, Datetime, StationCode)) %>%
+  arrange(Datetime, StationCode) %>%
+  mutate(Year = year(Datetime),
+         Date = date(Datetime)) %>%
+  mutate(OrganismCode = ifelse(Date>= as.Date("2021-08-09") & OrganismCode %in% c("BFK", "RFK"), "KLF", OrganismCode)) %>%
+  group_by(Year, OrganismCode) %>%
+  mutate(num = 1:n()) %>%
+  ungroup() %>%
+    group_by(Datetime, StationCode, OrganismCode, Year,) %>%
+  mutate(SampleID = paste0(format(Datetime,"%Y%m%d_%H%M"), "_", StationCode, "_", OrganismCode),
+         OrganismID = ifelse(!is.na(ForkLength) | !is.na(TotalLength), paste0(Year, "_", OrganismCode, num), NA)) %>%
+  ungroup() %>%   
+  filter(Year<2023) %>%
+  select( -Datetime, -Date,  -StationCode, -num, -Year)
+
+# Make all consistent "minus"
+fish_catch_clean$FishGenID <- gsub("minus", "min", fish_catch_clean$FishGenID)
+fish_catch_clean$FishGenID <- gsub("min", "minus", fish_catch_clean$FishGenID)
+
+# Checks of variable codes
+unique(fish_catch_clean$MarkCode)
+unique(fish_catch_clean$StageCode) ### Check if there are changes
+unique(fish_catch_clean$SpawningCondition)
+unique(fish_catch_clean$Sex)
+unique(fish_catch_clean$RaceByLength)
+
+# QA/QC further checks
+#FishTagIDs <- filter(fish_catch_clean, FishTagID != "")
+noCount <- filter(fish_catch_clean, Count == 0 | is.na(Count) | Count == "") 
+needRace <- filter(fish_catch_clean, is.na(RaceByLength) & OrganismCode == "CHN" & !is.na(ForkLength))
+
+```
+
+### Taxa
+```{r}
+# Taxa
+fish_tax_clean <- fish_tax %>%
+  select(OrganismCode, CommonName, Native, Phylum, Class, Order, Family, Genus, Species) %>%
+  mutate(Species = replace(Species, is.na(Species), "spp."),
+         CommonName = replace(CommonName, CommonName == "AMMOCOETE LAMPREY", "Ammocoete Lamprey"),
+         Phylum = replace(Phylum, OrganismCode == "AMM", "Chordata"),
+         Class = replace(Class, OrganismCode == "AMM", "Cephalaspidomorphi"),
+         Order = replace(Order, OrganismCode == "AMM", "Petromyzontiformes"),
+         Family = replace(Family, OrganismCode == "AMM", "Petromyzontidae"),
+         Genus = replace(Genus, OrganismCode == "AMM", "Lampetra")) %>%
+   mutate(Native = ifelse(OrganismCode %in% c("RFK", "KLF"), "I", Native)) %>%
+  mutate(Species = tolower(Species))%>%
+  mutate(Taxa = ifelse(is.na(Genus), paste(Family, Species), paste(Genus, Species)),
+         Taxa = replace(Taxa, Taxa == "Menidia beryllina", "Menidia audens"),
+         Taxa = replace(Taxa, Taxa == "Hysterocarpus traski", "Hysterocarpus traskii"),
+         Taxa = replace(Taxa, Taxa == "NoCatch", NA)) 
+
+# fish_tax_ed_clean <- fish_tax_ed %>%
+  # dplyr::rename(OrganismCode = OrganismCode_FISH)
+```
+
+### Seine
+```{r}
+# Seine
+seine_clean <- seine %>%
+  select(c(EventID = SampleID, SeineLength, SeineWidth, SeineDepth, Volume=VolumeSeined, SubstrateCode, HabitatType, SeineComments = Comments, Tide_Seine = Tide, ConditionCode))  %>%
+  mutate(SubstrateCode = case_when(
+    as.character(SubstrateCode) %in% c("Gravel", "grv", "GR", "mud and gr") ~
+             "GRV",
+             as.character(SubstrateCode) %in% c("Mud", "MD", "md", "mud") ~ "MUD",
+             as.character(SubstrateCode) %in% c("PV", "Pavement") ~ "PAV",
+             as.character(SubstrateCode) %in% c("Vegetation", "VG", "mud/veg")~"AVG",
+             as.character(SubstrateCode) %in% c("Sand", "SN", "silt")~"SND",
+             as.character(SubstrateCode) == "grass"~"TVG",
+             as.character(SubstrateCode) == "" ~ NA_character_,
+             TRUE ~ as.character(SubstrateCode))) %>%
+  mutate(HabitatType = replace(HabitatType, HabitatType == "Rip", "RIP"),
+         HabitatType = replace(HabitatType, HabitatType == "Veg", "VEG")) %>%
+  mutate(across(.cols = c(HabitatType, Tide_Seine), .fns = na_if, "")) 
+unique(seine_clean$HabitatType) #good
+unique(seine_clean$SubstrateCode) # good
+unique(seine_clean$Region)
+unique(seine_clean$Tide_Seine)
+```
+
+### Trap Effort
+```{r}
+# Trap
+trap_clean <- left_join(fish_ref_clean %>% select(StationCode, MethodCode,SampleDate, Datetime, EventID),trap %>% select(EventID = SampleID, Comments, TrapStatus, Tide)) %>%
+  mutate(effort.hrs = NA) %>%
+  rename(TrapComments = Comments,
+         EffortHours = effort.hrs) %>%
+  select(StationCode, MethodCode,SampleDate, Datetime, EventID, TrapStatus, Tide, EffortHours, TrapComments) %>%
+  filter(SampleDate<as.Date("2010-01-01"),
+         MethodCode %in% c("FKTR", "RSTR")) %>%
+   mutate(across(.cols = c(Tide, TrapStatus), .fns = na_if, ""))
+
+unique(trap_clean$TrapStatus)
+unique(trap_clean$Tide)
+
+
+# Effort
+effort_clean <- effort %>%
+  mutate(Datetime = lubridate::ymd_hms(Datetime),
+         SampleDate = lubridate::ymd(SampleDate),
+         MethodCode = factor(MethodCode),
+         StationCode = factor(StationCode)) %>%
+  rename(TrapComments = Comments,
+         EffortHours = effort.hrs,
+         EventID = SampleID)%>%
+   mutate(across(.cols = c(Tide), .fns = na_if, ""))
+
+# Combine trap effort (2010 - .) with other trap (prior to 2010) so you get trap status 
+trapeffort_clean <- rbind(trap_clean, effort_clean) %>%
+  rename(Tide_Trap = Tide)
+
+unique(effort_clean$Tide)
+unique(trapeffort_clean$Tide)
+```
+
+### Genetics and CWT
+```{r}
+## genetics ##
+smelt_gen_clean <- smelt_gen %>%
+  dplyr::rename(FishGenID = FishTagID,
+                GeneticID = SPECIES..Assay.ID.,
+                qDSM = q..DS.,
+                qLFS = q..LF.,
+                qWAG = q..WK.,
+                NumChrom = X..Chroms,
+                VShape = V.shape,
+                Comments_Smelt = COMMENTS)%>%
+  mutate(
+    SmeltGeneticRowID = 1:nrow(.),
+    GeneticID = case_when(
+    GeneticID == "hybrid (LFS/WAG)" ~ "HYB_LFS_WAG",
+    GeneticID == "hybrid (DSM/WAG)" ~ "HYB_DSM_WAG",
+    GeneticID == "missing data" ~ "UNK",
+    GeneticID == "" ~ "UNK",
+    TRUE ~ as.character(GeneticID))) %>%
+  select(SmeltGeneticRowID, FishGenID, qDSM, qWAG, qLFS, GeneticID, Comments_Smelt) 
+
+unique(smelt_gen_clean$GeneticID)
+unique(smelt_gen_clean$VShape)
+```
+
+```{r}
+salm_gen_clean <- salm_gen %>%
+  dplyr::rename(FishGenID = FishTagID,
+    GeneticID = BestEstimate,
+                GeneticID2 = X2ndBestEstimate,
+                Comments_Salmon = Comments)  %>%
+  mutate(SalmGeneticRowID = 1:nrow(.),
+    GeneticID = case_when(
+    GeneticID %in% c("f", "F")~ "Fall",
+    GeneticID == "S"~ "Spring",
+    GeneticID == "LF"~ "LateFall",
+    GeneticID == "W"~ "Winter",
+    GeneticID %in% c("U", "")~ "n/p", 
+    TRUE ~ as.character(GeneticID))) %>%
+  mutate(GeneticID2 = case_when(
+    GeneticID2 %in% c("f", "F")~ "Fall",
+    GeneticID2 == "S"~ "Spring",
+    GeneticID2 == "LF"~ "LateFall",
+    GeneticID2 == "W"~ "Winter",
+    GeneticID2 %in% c("U", "")~ "n/p", 
+    TRUE ~ as.character(GeneticID2))) %>%
+  mutate(Comments_SalmonDataUsage = "Please contact Mariah Meek (mhmeek@msu.edu) if you wish to share or publish any salmonid genetics data") %>%
+  select(SalmGeneticRowID, FishGenID, GeneticID, Probability1 = Prob1, GeneticID2, Probability2 = Prob2, Comments_Salmon, Comments_SalmonDataUsage)
+unique(salm_gen_clean$GeneticID)
+
+salm_gen_clean$FishGenID <- gsub("minus", "min", salm_gen_clean$FishGenID)
+salm_gen_clean$FishGenID <- gsub("min", "minus", salm_gen_clean$FishGenID)
+```
+
+# C. Content QA/QC
+
+## 4. Clean Sampling (Event) Information
+
+### a) Join effort and sampling tables
+### b) Remove known incorrect IDs, replace with corrected dates from effort file
+```{r}
+#remove rows with comments that indicate the fyke was not set (copied over from effort file)
+fykeNotSet_ids <- c(3192, 7118, 7641, 8050, 8051, 8361, 9261, 9407, 9408, 9409, 9410, 9485, 9261, 9406, 9407, 9408, 9409, 9410, 9485)
+#remove duplicated/mis-entered samples (copied over from effort file)
+dataEntry_ids <- c(1698, 1858, 1862, 2009, 2477, 2826, 5028, 6820, 6971, 7065, 7616)
+
+Sample_effort <- (fish_ref_clean %>% select(-SampleDate)) %>%
+  filter(!(EventID %in% c(fykeNotSet_ids, dataEntry_ids))) %>%
+  left_join(trapeffort_clean, by = c("StationCode", "EventID", "MethodCode"))%>%
+  mutate(Datetime = if_else(is.na(Datetime.y), ymd_hms(Datetime.x), ymd_hms(Datetime.y)),
+        SampleDate = as.Date(Datetime)) %>%
+  dplyr::select(-Datetime.x,  -Datetime.y, -Datetime.x, -Datetime.y)%>%
+  dplyr::select(EventID, Datetime, SampleDate, StationCode, MethodCode, everything())%>%
+  filter(!is.na(EventID),
+         !is.na(Datetime)) %>%
+  arrange(MethodCode)
+
+```
+
+### c) Join seine table
+```{r}
+seine_large <- seine_clean %>%
+  left_join(Sample_effort %>%select(EventID, SampleDate, StationCode)) %>%
+  filter(SeineDepth>2 | Volume>300)
+
+seine_clean_qc <- seine_clean %>%
+  mutate(SeineDepth = replace(SeineDepth, EventID == 8356, 0.7))
+```
+
+
+```{r}
+str(Sample_effort)
+
+Sample_effort_seine <- left_join(Sample_effort, seine_clean_qc) %>%
+  mutate(GearConditionCode = ifelse(is.na(GearConditionCode) & !is.na(ConditionCode), ConditionCode, GearConditionCode)) %>%
+ # mutate_if(is.factor, empty_as_na) %>%
+ # mutate_if(is.character, empty_as_na) %>%
+  mutate(FieldComments = ifelse(MethodCode == "BSEIN", SeineComments,
+                                ifelse(MethodCode %in% c("RSTR","FKTR"), TrapComments, NA))) %>%
+  mutate(Tide = ifelse(MethodCode == "BSEIN", Tide_Seine,
+                       ifelse(MethodCode %in% c("RSTR", "FKTR"), Tide_Trap, NA)))%>%
+  arrange(MethodCode)%>%
+  select(-c(ConditionCode, TrapComments, SeineComments, Tide_Trap, Tide_Seine))
+```
+
+### d) Export comments and evaluate. 
+```{r}
+SampleComments <- Sample_effort_seine %>% 
+  select(c(EventID, SampleDate, Datetime, StationCode, WaterTemp, GearConditionCode, MethodCode,FieldComments, TrapStatus, GearConditionCode)) %>%
+  filter(!(is.na(FieldComments))) %>%
+  mutate(SampleChange = "")
+
+#write.csv(SampleComments, "SampleComments.csv")
+check2021 <- filter(SampleComments, year(SampleDate) == 2021 & FieldComments!="")
+```
+
+### e) Make changes made to condition code
+```{r}
+shouldbe1 <- c(3980, 6027, 7159, 7724, 8055, 8283, 8751, 6129, 6130, 8068, 8067, 8436, 8551, 8562, 8448, 8624, 8628, 8629,8635,8652,
+               # screw trap
+               5933, 5934, 7444)
+
+# missing or hyacinth related , fyke not in middle of channel
+shouldbe4 <- c(4016, 4014, 4013, 4015, 4340, 4947, 5471, 5503, 5532, 8317, 6039, 6256, 6991)
+shouldbe3 <- c(8282, 7564)# very poor condition
+shouldbe2 <- c(1524, 1525,1401, 2680, 4228, 5948, 7587, 6865, 6109, 6849, 761, 762, 829, 835, 1086, 1113, 7561,
+               #screw trap
+               1401, 5279, 6540 )
+# no seine (hyacinth, too shallow, too deep): 4016, 4014, 4013, 4015, 4340, 4947, 5471, 5503, 5532, 6039, 6849 (check), 6256 (tide is too high??), 6991 (check), 
+# twisted bag: 5948, 7587
+# flipped seine: 6109
+# clogged cone/debris: 1401
+# might have lost some catch: 2680
+# fyke not set to full depth: 761, 762, 1113
+# fish escape: 829, 835, 1086, 7561, 7564
+```
+
+### f) Add flag for change to sample
+```{r}
+sampleChange <- c(5096, 5093, 4844, 5493, 5510, 5859, 6038, 6077, 6104, 6436, 6517, 6590, 6589, 6617, 6654, 6677, 6988, 6989, 7133, 7159, 7167, 7535, 7724, 8209, 8227, 8243, 8290, 8283, 8751, 8058,8673, 2307, 4806, 6106,6116, 7116, 7141, 7258, 7591, 7682, 7695, 7883, 8055, 8151, 8474, 8494, 8622, 8673, 9014, 3438, 7409, 8160, 8440, 8448, 3290, 3292, 3293, 3295, 6129, 6130, 7266, 8068, 8067, 8436, 8437, 8404, 8403, 8401, 8442, 7515, 8551, 8562, 8624, 8628, 8629, 8635, 8652, 8318, 8469, 8532, 8575, 8604, 7261, 7486, 7492, 8173, 8548, 9057, 8656, 3946, 4741, 9305, 9384,  9432, 9441, 9474, 9663)
+# change in amount of time set/distance of seine: 5096, 5093, 4844, 5493, 5510, 5859, 6038, 6077, 6104, 6436, 6517, 6590, 6589, 6617, 6654, 6677, 6988, 6989, 7133, 7159, 7167, 7535, 7724, 8209, 8227, 8243, 8290, 8283, 8751, 8058
+
+# change in location of set: 8673, 2307, 4806, 6106,6116, 7116, 7141, 7258, 7591, 7682, 7695, 7883, 8055, 8151, 8474, 8494, 8622, 8673, 9014, 3438, 7409, 8160, 8440, 8448, 9305, 9384, 9432, 9441, 9663
+
+# Fyke not in center of channel: 3290, 3292, 3293, 3295, 6129, 6130, 7266, 8068, 8067, 8436, 8437, 8404, 8403, 8401, 8442, 7515, 8551, 8562, 8624, 8628, 8629, 8635, 8652
+
+# moved around veg, changed width: 8318
+
+# parallel: 8469, 8532, 8575, 8604, 7261, 7486, 7492, 8173, 8548, 9057, 8656
+
+# screw trap not in center of toe drain: 3946, 4741
+
+# Not adding these for now, since I think a lot are unmarked
+# short set RSTR: 4103, 4101, 4099, 4436, 4441, 4443, 4445, 4449, 4452, 4453, 4454, 4456, 4460, 4479, 4502, 4508, 4514, 5620, 4528, 4539, 4541, 4542, 4544, 4536, 4558, 5086, 5099, 5097, 5093, 5094, 5090, 6865, 7358, 7360, 7364, 7376, 7420, 7423, 7424, 7427, 7444, 7465, 7464, 7467, 7480, 7503, 7504, 7509, 7525, 7543,7608,7567,7566,7609,7610,7603,7602,
+```
+
+### g) Make changes
+```{r}
+Sample_effort_clean <- Sample_effort_seine %>%
+  mutate(GearConditionCode = 
+           case_when(EventID %in% shouldbe4 ~ 4,
+                     EventID %in% shouldbe3 ~ 3,
+                     EventID %in% shouldbe2 ~ 2,
+                     EventID %in% shouldbe1 ~ 1,
+                     TRUE ~ as.numeric(GearConditionCode))) %>%
+  mutate(SampleAltered = ifelse(EventID %in% sampleChange, "Y", SampleAltered))
+```
+
+### h) Convert to 1 effort table, 1 environmental/event table
+#### NK 11/22: changed from "effort_alone" to "effort_final" given updates to qc_calculate_effort_traps code
+```{r}
+effort_final <- Sample_effort_clean %>%
+  select(EventID, SeineLength, SeineWidth, SeineDepth, SeineVolume = Volume, TrapStatus, TrapHours = EffortHours)
+
+Sample_alone <- Sample_effort_clean %>%
+  select(EventID, StationCode, Datetime, SampleDate, WaterTemp, SpecificConductance, Conductivity, Turbidity, DO, pH, Secchi, Tide, WeatherCode, VegetationRank,SubstrateCode, HabitatType, MicrocystisRank, MethodCode, GearCode, GearConditionCode, SampleAltered,  FieldComments)
+```
+
+
+## 5. Find Water quality outliers
+
+### a) Create regions for visualizations
+```{r}
+# Create regions for visualization -----------------------
+AL <- c("AL1", "AL2", "AL3", "AL4", "LIS")
+BL <- c("BL1", "BL2", "BL3", "BL4", "BL5", "BL6", "STTD", "PCS")
+Other <- c("YB", "FW1", "SB1",  "RD22", "YBI80", "SB2", "LIHF", "LIHFS")
+```
+
+### b) Separate out WQ
+```{r}
+# Separate and clean WQ -------------------------------------
+fish_WQ <- Sample_alone %>%
+  select(c(Datetime, StationCode, EventID, MethodCode,FieldComments, WaterTemp:Secchi))%>%
+  filter(!(is.na(Datetime)),
+         !(is.na(StationCode)),
+         !(StationCode %in% c("", "Alt_Fyke", "CCS1", "CCS2", "CCS3", "CCS4", "CCS5", "CCS6", "STB", "STS", "YBSP1"))) %>%
+  mutate(Region = ifelse(StationCode %in% AL, "AL", ifelse(StationCode %in% BL, "BL", "Other"))) %>%
+  mutate(Month = month(Datetime),
+         Year = year(Datetime),
+         MonthAbb=month(Datetime, label = TRUE))
+```
+
+### c) Look at mins and maxes of parameters
+```{r}
+source("WQ_plots.R")
+Table_WQ_All <- fish_WQ %>%
+  group_by(Region) %>%
+summarize(min.temp = min(WaterTemp, na.rm=T),
+            max.temp = max(WaterTemp, na.rm=T),
+            min.Conductivity = min(Conductivity, na.rm=T),
+            max.Conductivity = max(Conductivity,na.rm=T),
+            min.SPC = min(SpecificConductance,na.rm=T),
+            max.SPC = max(SpecificConductance,na.rm=T),
+            min.Secchi = min(Secchi,na.rm=T),
+            max.Secchi = max(Secchi,na.rm=T),
+            min.Turbidity = min(Turbidity,na.rm=T),
+            max.Turbidity = max(Turbidity,na.rm=T),
+            min.pH = min(pH,na.rm=T),
+            max.pH = max(pH,na.rm=T),
+            min.DO = min(DO,na.rm=T),
+            max.DO = max(DO,na.rm=T),
+            n = n()) 
+
+kable(t(Table_WQ_All)) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+```
+
+### d) Make data long
+```{r}
+fish_WQ_long <- pivot_longer(fish_WQ, cols = c(WaterTemp:Secchi),names_to = "Parameter", values_to = "Value") %>%
+  mutate(Index = 1:nrow(.))
+```
+
+### e) Plot data and ID outliers
+```{r}
+# Regions ------------------------------------------
+AL_data <- filter(fish_WQ_long, Region == "AL") %>% arrange(StationCode, Datetime)
+BL_data <- filter(fish_WQ_long, Region == "BL") %>% arrange(StationCode, Datetime)
+Other_data <- filter(fish_WQ_long, Region == "Other") %>% arrange(StationCode, Datetime)
+
+# AL -------------------------------------------------
+AL_plots <- AL_data %>%
+  ggplot(aes(x= Datetime, y = Value, color = StationCode, text = paste("Index:", Index, "SampleID:", EventID))) + geom_point(size = 0.5) +  facet_wrap(~Parameter, scales = "free")
+plotly::ggplotly(AL_plots)
+
+AL_boxplots <- AL_data %>%
+  ggplot(aes(x= factor(Month), y = Value, fill = factor(Month))) + geom_boxplot(size = 0.5) +  facet_wrap(~Parameter, scales = "free")
+plotly::ggplotly(AL_boxplots)
+
+# Outliers
+fish_WQ_outliers <- fish_WQ %>%
+  mutate(Flag_WQ = ifelse((pH< 6.1 | pH > 10 | Turbidity > 400 | Secchi == 0.8), 2, ""),
+         Comment_WQ = case_when(pH< 6.1 | pH > 10 ~ "pH",
+                                Turbidity > 400 ~ "Turbidity",
+                                Secchi == 0.8 ~ "Secchi",
+                                TRUE~as.character("")))
+
+
+# BL ----------------------------------------------------
+BL_plots <- BL_data %>%
+  ggplot(aes(x= Datetime, y = Value, color = StationCode, text = paste("Index:", Index, "EventID:", EventID))) + geom_point(size = 0.5) +  facet_wrap(~Parameter, scales = "free")
+plotly::ggplotly(BL_plots)
+
+BL_boxplots <- BL_data %>%
+  ggplot(aes(x= factor(Month), y = Value, fill = factor(Month))) + geom_boxplot(size = 0.5) +  facet_wrap(~Parameter, scales = "free")
+plotly::ggplotly(BL_boxplots)
+
+fish_WQ_outliers2 <- fish_WQ_outliers %>%
+  mutate(Flag_WQ = ifelse((pH>12 | pH < 5 | DO < 3| Turbidity > 700), 2, NA),
+         Comment_WQ = case_when(pH> 12 | pH <5 ~ "pH",
+                                DO < 3 ~ "DO",
+                                Turbidity > 700 ~ "Turbidity",
+                                TRUE~as.character("")))
+
+
+# Other --------------------------------------
+Other_plots <- Other_data %>%
+  ggplot(aes(x= Datetime, y = Value, color = StationCode, text = paste("Index:", Index, "EventID:", EventID))) + geom_point(size = 0.5) +  facet_wrap(~Parameter, scales = "free")
+plotly::ggplotly(Other_plots)
+
+Other_boxplots <- Other_data %>%
+  ggplot(aes(x= factor(Month), y = Value, fill = factor(Month))) + geom_boxplot(size = 0.5) +  facet_wrap(~Parameter, scales = "free")
+plotly::ggplotly(Other_boxplots)
+
+fish_WQ_outliers3 <- fish_WQ_outliers2 %>%
+  mutate(Flag_WQ = ifelse((pH>10 | pH < 5 | Secchi >1.1 | Turbidity > 700 | WaterTemp<5.6|Conductivity >2000|SpecificConductance>2000), 2, NA),
+         Comment_WQ = case_when(pH > 10 | pH <5 ~ "pH",
+                                Secchi >1.1 ~ "Secchi",
+                                Turbidity > 700 ~ "Turbidity",
+                                WaterTemp<5.6 ~ "WaterTemp",
+                                Conductivity>2000 ~ "Conductivity",
+                                SpecificConductance > 2000 ~ "SpecificConductance",
+                                TRUE~as.character("")))
+```
+
+Correlation plots
+```{r}
+par(mfrow = c(2,2))
+ggplot(fish_WQ_outliers3) + geom_point(aes(WaterTemp, DO, color = Region))
+ggplot(fish_WQ_outliers3) + geom_point(aes(Conductivity, SpecificConductance, color = Region))
+ggplot(fish_WQ_outliers3) + geom_point(aes(Secchi, Turbidity, color = Region))
+phtemp <- ggplot(fish_WQ_outliers3) + geom_point(aes(pH, WaterTemp, color = Region, text = paste("EventID:", EventID)))
+ggplotly(phtemp)
+
+#4114 and 5980 already flagged
+```
+
+### f) Make outliers long
+#### NK 11/22: ODWGtools function on line 609 wasn't working so skipped lines 598-669 and plugged fish_WQ_outliers 3 into following code
+```{r}
+outlier_long <- pivot_longer(fish_WQ_outliers3, cols = c(WaterTemp:Secchi),names_to = "Parameter", values_to = "Value") %>%
+  mutate(Index = 1:nrow(.)) %>%
+  mutate(Outlier_vis = ifelse(Comment_WQ == Parameter, 3L, 0L))
+```
+
+
+### g) Calculate Tukey, MAD outliers, calculate rate of change
+### h) Calculate "Outlier" to sum up Tukey, MAD, Visual outlier numbers
+### i) Classify into 1 = acceptable, 2 = suspicious, 3 = highly suspicious
+```{r}
+library(ODWGtools)
+Outliers0 <- outlier_long %>%
+  #filter(!(Index %in% toremove)) %>%
+  group_by(Region, StationCode, Parameter) %>%
+  arrange(StationCode, Datetime, Parameter) %>%
+  mutate(Tukey = outlier_tukey(Value, na.rm = TRUE),
+         MAD = outlier_mad(Value, mask = !is.na(Value)),
+         Tukey_num = ifelse(Tukey == "extreme outlier", 2L, ifelse(Tukey == "mild outlier", 1L, ifelse(Tukey == "not outlier", 0L, Tukey))),
+         MAD_num = ifelse(MAD == "extreme outlier", 2L, ifelse(MAD == "mild outlier", 1L, ifelse(MAD == "not outlier", 0L, MAD))),
+        # Outlier_vis = ifelse(Index %in% Index_vis_outlier, 2L, 0L),
+         Outlier = Tukey_num + MAD_num + Outlier_vis,
+        Outlier_P = ifelse(Outlier>1, Parameter, NA)) %>%
+  mutate(Outlier_WQ = ifelse(Outlier >=5, 3, ifelse(Outlier>1, 3, 1))) %>%
+       #  lag = difftime(Datetime, lag(Datetime), units = "days")) %>%
+       #  RateLag = round(rpdlag(Value),2),
+       #  RateLead = round(rpdlead(Value),2))%>%
+  ungroup() 
+```
+
+### j) Plot Outliers
+```{r}
+# BL Sites
+BL_outliers <- Outliers0 %>%
+filter(Region == "BL") %>%
+ggplot() + 
+  geom_point(aes(Datetime, Value, colour = factor(Outlier), text = Index), size = 1) + 
+  facet_wrap(~Parameter, scales = "free") + scale_colour_viridis(discrete = TRUE) + theme_bw() + labs(title = "AL")
+BL_outliers
+
+# AL Sites
+Outliers0 %>%
+filter(Region == "AL") %>%
+ggplot() + 
+  geom_point(aes(Datetime, Value, colour = factor(Outlier)), size = 1) + 
+  facet_wrap(~Parameter, scales = "free") + scale_colour_viridis(discrete = TRUE) + theme_bw()  + labs(title = "BL")
+
+# Other
+Outliers0 %>%
+filter(Region == "Other") %>%
+ggplot() + 
+  geom_point(aes(Datetime, Value, colour = factor(Outlier)), size = 1) + 
+  facet_wrap(~Parameter, scales = "free") + scale_colour_viridis(discrete = TRUE) + theme_bw() + labs(title = "Other")
+```
+
+```{r}
+OutliersToCheck <- filter(Outliers0, Outlier >=1)
+```
+
+### k) Convert outliers to wide format
+### l) Combine outliers into 1 column, parameters of outliers into 1 column
+```{r}
+Outliers_wide0 <- Outliers0 %>% 
+  select(-c(Index:MAD_num, Comment_WQ, Flag_WQ,Outlier)) %>% pivot_wider(names_from = (Parameter), values_from = c(Value, Outlier_WQ, Outlier_P), id_cols = "EventID") 
+
+Outliers_wide <- Outliers_wide0%>%
+  mutate(Flag_WQ = paste(Outlier_WQ_WaterTemp, Outlier_WQ_Conductivity, Outlier_WQ_SpecificConductance, Outlier_WQ_DO, Outlier_WQ_pH, Outlier_WQ_Turbidity, Outlier_WQ_Secchi, sep = ",")) %>%
+  mutate(Comment_WQ = paste(Outlier_P_WaterTemp, Outlier_P_Conductivity, Outlier_P_SpecificConductance, Outlier_P_DO, Outlier_P_pH, Outlier_P_Turbidity, Outlier_P_Secchi, sep = ",")) %>%
+  select(-c(Outlier_WQ_Conductivity:Outlier_P_WaterTemp))
+
+# Rename parameters
+colnames(Outliers_wide)[2:8] <-  sub("Value_*", "", colnames(Outliers_wide)[2:8])
+```
+
+### m) Combine WQ back with rest of Sample table
+#### NK 11/22: replaced Outliers_wide with fish_WQ_outliers3 in the following given issues with outliers package
+```{r}
+fish_sample_cleaned <- left_join(Sample_alone, fish_WQ_outliers3 %>% select(EventID, Flag_WQ, Comment_WQ)) %>%
+ select(EventID, StationCode, Datetime, SampleDate, WaterTemp, SpecificConductance, Conductivity, Turbidity, DO, pH, Secchi, Tide, WeatherCode, VegetationRank,SubstrateCode, HabitatType, MicrocystisRank, MethodCode, GearCode, GearConditionCode, SampleAltered,  FieldComments, Flag_WQ, Comment_WQ) %>%
+  filter(GearConditionCode<3)
+
+filterEventID <- unique(fish_sample_cleaned$EventID)
+```
+
+## 6. Check fish catch table
+
+### a) Filter to events in sample_cleaned; check MethodCode
+```{r}
+fish_catch_QC0 <- fish_catch_clean %>%
+  filter(EventID %in% filterEventID) %>%
+  left_join(fish_sample_cleaned %>% select(EventID, MethodCode))
+
+noMethod <- filter(fish_catch_QC0, is.na(MethodCode))
+noMethodID <- unique(noMethod$EventID)
+```
+
+Remove fish with no method attached - could be because sample was removed due to lack of date. 
+```{r}
+fish_catch_QC <- fish_catch_QC0 %>%
+  filter(!is.na(MethodCode))
+```
+
+### b) QC fish catch/plus counts
+```{r}
+check_counts <- fish_catch_QC %>%
+  filter((PlusCount == TRUE|OrganismCode == "NONE") & !is.na(ForkLength) ) %>%
+  select(EventID, SampleID, OrganismID, OrganismCode, ForkLength, Count, PlusCount)
+
+# QC notes -----------------------------------------------------------
+
+# These ones are accurate, just took into account multiple fish with same length
+PlusCountFalse = c("2010_LP376", "2011_LP526")
+#20100930_1100_AL3_LP, 20110819_1102_AL4_LP
+
+# These had the wrong count
+Count1 = "2011_LP376"
+# These are samples that are helping account for others that combined plus count and a measured fish into one row
+Count2 = "2013_MSS1943"
+FLNA = "2013_MSS1969"
+#20130604_1055_YB_MSS
+
+# These are mistakes
+None = c("2007_NONE1", "2007_NONE6", "2007_NONE7", "2010_NONE3")
+
+
+# Make changes -------------------------------------------------
+fish_catch_QC2 <- fish_catch_QC %>%
+  mutate(PlusCount = replace(PlusCount, OrganismID %in% PlusCountFalse, "FALSE"),
+         Count = replace(Count, OrganismID %in% Count1, 1),
+         Count = replace(Count, OrganismID %in% Count2, 2),
+         ForkLength = replace(ForkLength, OrganismID %in% FLNA, NA)) %>%
+  filter(!(OrganismID %in% None))
+```
+
+### c) No catch
+Check no catch entries that don't say no catch in comments, see if there is other fish catch in that sample. 
+```{r}
+# Remove samples that clearly say no catch for the QC
+fish_nocatch <- fish_catch_QC2 %>%
+  filter(OrganismCode == "NONE") %>%
+  left_join(fish_sample_cleaned %>% select(EventID, FieldComments)) %>%
+  filter(!grepl('No fish|No fish|zero catch|No catch|No Fish', FieldComments))
+
+# Get unique IDs for remaining "NONE"s
+events <- fish_nocatch$EventID
+
+# What do these events look like, is there other catch? Filter to those where n>1
+checkNoCatch <- filter(fish_catch_QC2, EventID %in% events) %>%
+  group_by(EventID) %>%
+  mutate(n = n()) %>%
+  filter(n>1)
+
+# Find unique IDs for those with more than 1 catch
+incorrectevents <- unique(checkNoCatch$EventID)
+
+# Remove the "NONE" lines
+fish_catch_QC3 <- fish_catch_QC2 %>%
+  filter(!(EventID %in% incorrectevents & OrganismID == "NONE"))
+```
+
+Upon joining sample and catch (in integrate_fish_data.Rmd lines 54-62), found several OrganismCodes of "NA". Most were "no catch" that did not have a "NONE" in the catch table. 
+
+* Created data frame of entries of NONE to add to total_catch table
+* Created a row for a shrimp plus count that was not included
+* Found some weird things going on with effort, see below
+```{r}
+#check <- fishNA %>%
+#  filter(!grepl('No fish|No fish|zero catch|No catch|No Fish|NO FISH|NO CATCH|nothing|no catch|No Catch|no fish|only one larval|Only one larval', FieldComments))
+
+shouldbeNONE <- c(653, 759, 5564, 1701, 1821, 7464, 7507, 7509, 7514, 637, 5149, 5599, 5617, 5641, 5658, 6619, 7764, 7837, 6823, 7355, 7419, 7420, 7465, 7503, 7506, 7508, 7511, 7524, 7525, 8177, 8184, 8217)
+
+# Make data frame to add to the rest of total_catch. These should eventually be modified in the database. 
+addNONE <- data.frame(EventID = c(shouldbeNONE, 2662), OrganismCode = c(rep("NONE", 32), "SHR"),  Count = c(rep(1, 32), 21)) %>%
+  left_join(fish_sample_cleaned %>% select(Datetime, EventID, StationCode)) %>%
+  mutate(SampleID = paste0(format(Datetime,"%Y%m%d_%H%M"), "_", StationCode, "_", OrganismCode)) %>%
+  select(SampleID, EventID, OrganismCode, Count)
+
+# 2662: Enter SHR plus count = 21
+
+# Also found some efforts off: 5028 needs to pass effort to 5029 and be removed, 6820 needs to pass its effort to 6821 and be removed. This is done below in the final effort table, but could probably be done in the effort script. - NK updates to effort script incorporate this
+```
+
+### d) Make separate tables
+
+Make table of total catch
+```{r}
+total_catch0 <- fish_catch_QC3 %>%
+  group_by(EventID, SampleID, OrganismCode) %>%
+  summarize(Count = sum(Count))  %>%
+  ungroup() %>%
+  select(SampleID, EventID, OrganismCode, Count)
+
+# Add in additional missed value from the OrganismID = NA search
+total_catch <- rbind(total_catch0, addNONE) %>%
+  arrange(SampleID)
+```
+
+Make table for individuals
+```{r}
+individuals0 <- fish_catch_QC3 %>%
+  filter(PlusCount == FALSE) %>%
+  select(OrganismID, FishGenID, EventID, OrganismCode, ForkLength, TotalLength, Weight, Sex, RaceByLength, StageCode, Dead, Expression, GeneticSample, FishIDComments)
+```
+
+### e) Check out small fish
+```{r}
+smallFish <- fish_catch_QC3 %>%
+  filter(ForkLength<20)
+
+FL_NA <- "2020_CHN10"
+
+individuals <-  individuals0 %>%
+  mutate(ForkLength = replace(ForkLength, OrganismID %in% FL_NA, NA))
+```
+
+### f) Just an overall look at catch and length - leaving these as they are since the extra high lengths, counts seem plausible
+```{r}
+individuals_methods <- individuals %>%
+  left_join(fish_sample_cleaned %>%select(EventID, MethodCode))
+total_catch_methods <- total_catch %>%
+  left_join(fish_sample_cleaned %>%select(EventID, MethodCode))
+
+ggplot(individuals_methods) + geom_boxplot(aes(x = OrganismCode, y = ForkLength, fill = OrganismCode)) + 
+  facet_wrap(~MethodCode, scales = "free",nrow = 3) + theme(axis.text.x = element_text(angle = 90))
+
+ggplot(total_catch_methods) + geom_boxplot(aes(x = OrganismCode, y = Count, fill = OrganismCode)) + 
+  facet_wrap(~MethodCode, scales = "free",nrow = 3) + theme(axis.text.x = element_text(angle = 90))
+
+highcatch <- filter(total_catch_methods, Count> 200) %>%
+  filter(!OrganismCode %in% c("SHR", "SHRK")) 
+
+ggplot(highcatch) + geom_boxplot(aes(OrganismCode, Count))
+```
+
+
+## 7. Make final tables
+
+### a) Filter station table to what is in dataset
+
+```{r}
+finalStations <- unique(fish_sample_cleaned$StationCode)
+stations_clean <- fish_stations_only %>%
+  filter(StationCode %in% finalStations)
+```
+
+### b) Add in IEP Fish Code and filter to species we have
+```{r}
+finalFish <- unique(fish_catch_QC3$OrganismCode)
+
+## Keep fixing species
+taxonomy_clean <- left_join(fish_tax_clean, iepfishcodes, by = "Taxa") %>%
+  filter(OrganismCode %in% finalFish) %>%
+  mutate(IEPFishCode = case_when(OrganismCode == "AMM" ~ "AMMLAM",
+                                 OrganismCode == "CAT" ~ "UNISIL",
+                                 OrganismCode == "CMC" ~ "CHMICR",
+                                 OrganismCode == "NONE" ~ "NOCATC",
+                                 OrganismCode == "PL" ~ "PACLAM",
+                                 OrganismCode == "RL" ~ "RIVLAM",
+                                 OrganismCode == "SAPM" ~ "SACPIK",
+                                 OrganismCode == "SCP" ~ "UNICOT",
+                                 OrganismCode == "SME" ~ "UNIOSM",
+                                 OrganismCode == "SNF" ~ "UNICEN",
+                                 OrganismCode == "UNID" ~ "UNIDEN",
+                                 OrganismCode == "YEB" ~ "YELBUL",
+                                 OrganismCode == "SHR" ~ "SIBPRA",
+                                 OrganismCode == "SHRK" ~ "MIGRSH",
+                                 OrganismCode == "KLF" ~ "UNIKIL",
+                                 TRUE~as.character(IEPFishCode))) %>%
+  mutate(Taxa = case_when(OrganismCode == "NONE" ~ "NoCatch",
+                          OrganismCode == "UNID" ~ "Unknown",
+                          TRUE ~ as.character(Taxa))) %>%
+  select(OrganismCode, IEPFishCode, everything()) %>%
+  select(-CommonName.y) %>%
+  rename(CommonName = CommonName.x) %>%
+   mutate(across(.cols = c(Native), .fns = na_if, "")) 
+  
+str(iepfishcodes)
+str(fish_tax_clean)
+```
+
+### c) Effort table, remove EventIDs
+#### NK 11/22: this is now incorporated into the effort script
+```{r}
+#effort_final <- Effort_alone %>%
+ # mutate(TrapHours = replace(TrapHours, EventID == 5029, 23.86667),
+      #   TrapHours = replace(TrapHours, EventID == 6821, 25.4666667
+#)) %>%
+ # filter(EventID %in% filterEventID) %>%
+   # filter(!EventID %in% c(6820, 5028))
+```
+
+### d) Add in zeroes for total catch
+```{r}
+# Figure out the first and last (alphabetical) OrganismCode for pivoting in next step
+orgs <- total_catch %>% select(OrganismCode) %>% arrange(OrganismCode) %>% unique() 
+first_org <- first(orgs$OrganismCode)
+last_org <- last(orgs$OrganismCode)
+
+total_catch_wide <- total_catch  %>%
+  arrange(OrganismCode) %>%
+  select(-SampleID ) %>%
+  distinct() %>%
+  pivot_wider(values_from = Count, 
+              names_from = OrganismCode,values_fill = 0) 
+
+total_catch_all <- total_catch_wide %>%
+  pivot_longer(cols = first_org:last_org,names_to = "OrganismCode", values_to = "Count") %>%
+  left_join(fish_sample_cleaned %>% select(EventID, Datetime, StationCode)) %>%
+  arrange(Datetime, StationCode) %>%
+  mutate(Year = year(Datetime),
+         Date = date(Datetime)) %>%
+    group_by(Datetime, StationCode, OrganismCode, Year) %>%
+  mutate(SampleID = paste0(format(Datetime,"%Y%m%d_%H%M"), "_", StationCode, "_", OrganismCode)) %>%
+  ungroup() %>%
+  select(SampleID, EventID, OrganismCode, Count) %>%
+  arrange(SampleID) %>%
+  filter(OrganismCode != "NONE")
+```
+
+
+## 8. Write cleaned tables
+Note: I had to change the "smart apostrophes" into regular straight apostrophes after writing these files since they weren't utf-8 encoding and had a slight error in EDI when trying to view through their data explorer. I think these appeared in the comments sections for the integrated_wq_totalcatch.csv, fish_unique.csv, and event.csv files. I just did a find and replace. The smart apostrophe you can copy by typing Im into word, right clicking, and selecting I'm (or any other abbreviated word - basically let Microsoft create the apostrophe for you). Copy the apostrophe, and paste in the the ctrl+F popup. Replace with normal apostrophe '. 
+
+```{r eval = FALSE}
+write.csv(stations_clean, "data_clean/station.csv", quote = TRUE, row.names = FALSE)
+write.csv(fish_sample_cleaned, "data_clean/event.csv", quote = TRUE, row.names = FALSE)
+write.csv(effort_final, "data_clean/effort.csv", row.names = FALSE)
+write.csv(total_catch_all, "data_clean/total_catch.csv", row.names = FALSE)
+write.csv(individuals, "data_clean/fish_unique.csv", quote = TRUE, row.names = FALSE)
+write.csv(taxonomy_clean, "data_clean/taxonomy.csv", row.names = FALSE)
+write.csv(salm_gen_clean, "data_clean/genetics_salmon.csv", quote = TRUE, row.names = FALSE)
+write.csv(smelt_gen_clean, "data_clean/genetics_smelt.csv", quote = TRUE, row.names = FALSE)
+saveRDS(total_catch_all, "data_clean/total_catch.rds") #version for GitHub
+```
+
